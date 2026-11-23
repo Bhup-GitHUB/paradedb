@@ -22,10 +22,21 @@ use crate::postgres::storage::{LinkedBytesList, LinkedBytesListWriter};
 use pgrx::pg_sys;
 use std::io::{BufWriter, Result, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use tantivy::directory::{AntiCallToken, TerminatingWrite};
 use tantivy::index::SegmentComponent;
+
+/// The part of a component that its writer's checkpoint made readable: its length, and the data
+/// blocks that hold it, in file order.
+#[derive(Debug)]
+pub struct CheckpointedPrefix {
+    pub len: usize,
+    pub blocks: Arc<Vec<pg_sys::BlockNumber>>,
+}
+
+/// A component's checkpoint, set at most once and shared between its writer and its directory.
+pub type SharedCheckpoint = Arc<OnceLock<CheckpointedPrefix>>;
 
 pub struct SegmentComponentWriter {
     inner: Option<InnerSegmentComponentWriter>,
@@ -72,6 +83,16 @@ impl SegmentComponentWriter {
             Arc::new(AtomicUsize::new(0))
         }
     }
+
+    /// The slot [`TerminatingWrite::checkpoint`] fills. It stays empty for a component that is
+    /// never checkpointed, and for one whose bytes are not stored.
+    pub fn checkpointed(&self) -> SharedCheckpoint {
+        if let Some(inner) = self.inner.as_ref() {
+            inner.checkpoint.clone()
+        } else {
+            Default::default()
+        }
+    }
 }
 
 impl Write for SegmentComponentWriter {
@@ -112,12 +133,23 @@ impl TerminatingWrite for SegmentComponentWriter {
             Ok(())
         }
     }
+
+    fn checkpoint(&mut self) -> Result<()> {
+        match self.inner.as_mut() {
+            Some(inner) => inner.checkpoint(),
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                format!("{:?} stores no bytes to checkpoint", self.path),
+            )),
+        }
+    }
 }
 
 struct InnerSegmentComponentWriter {
     header_blockno: pg_sys::BlockNumber,
     total_bytes: Arc<AtomicUsize>,
     buffer: Option<PanicSafeBufWriter<LinkedBytesListWriter>>,
+    checkpoint: SharedCheckpoint,
 }
 
 /// Wrapper around [`BufWriter`] that skips flush-on-drop while unwinding.
@@ -138,6 +170,10 @@ impl<W: Write> PanicSafeBufWriter<W> {
 
     fn into_inner(mut self) -> Result<W> {
         Ok(self.inner.take().unwrap().into_inner()?)
+    }
+
+    fn get_ref(&self) -> &W {
+        self.inner.as_ref().unwrap().get_ref()
     }
 }
 
@@ -171,7 +207,26 @@ impl InnerSegmentComponentWriter {
             header_blockno: segment_component.header_blockno,
             total_bytes: Default::default(),
             buffer: Some(PanicSafeBufWriter::new(segment_component.writer())),
+            checkpoint: Default::default(),
         }
+    }
+
+    /// Flushes the buffered bytes to their pages and publishes the blocks written so far. The
+    /// block list is shared from this writer, 4 bytes per data page: no page is written for it,
+    /// and the block map of the finished component is the one `terminate` writes.
+    fn checkpoint(&mut self) -> Result<()> {
+        let buffer = self.buffer.as_mut().unwrap();
+        buffer.flush()?;
+        let prefix = CheckpointedPrefix {
+            len: self.total_bytes.load(Ordering::Relaxed),
+            blocks: Arc::new(buffer.get_ref().blocks()),
+        };
+        self.checkpoint.set(prefix).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "segment component is already checkpointed",
+            )
+        })
     }
 
     pub fn total_bytes(&self) -> Arc<AtomicUsize> {
