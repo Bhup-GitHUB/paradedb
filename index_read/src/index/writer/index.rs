@@ -23,12 +23,15 @@ use std::sync::Arc;
 use tantivy::index::SegmentId;
 use tantivy::indexer::merger::IndexMerger;
 use tantivy::indexer::{AddOperation, IndexWriterOptions, SegmentWriter};
-use tantivy::schema::Field;
+use tantivy::schema::{Field, Value};
+use tantivy::vector::VectorRowsWriter;
 use tantivy::{
-    Directory, Index, IndexMeta, IndexWriter, Opstamp, Segment, SegmentMeta, TantivyDocument,
+    Directory, DocId, Index, IndexMeta, IndexSortByField, IndexWriter, Opstamp, Order, Segment,
+    SegmentMeta, TantivyDocument,
     directory::{ManagedDirectory, RamDirectory, TerminatingWrite},
 };
 
+use crate::api::CTID_FIELD_NAME;
 use crate::index::ctid_map;
 use crate::index::directory::build::BuildDirectory;
 use crate::index::mvcc::{MVCCDirectory, MvccSatisfies};
@@ -168,10 +171,29 @@ impl DiskSpaceGuard {
     /// Error out if the remaining segments are projected not to fit within the tablespace's
     /// available space.
     fn check(&self) -> Result<()> {
-        self.check_available(self.indexrel.available_disk_bytes(), "index's tablespace")
+        self.check_written(0)
+    }
+
+    /// [`Self::check`] when `written_bytes` of the output being written are on the tablespace
+    /// already and so are not required of its available space.
+    fn check_written(&self, written_bytes: u64) -> Result<()> {
+        self.check_required(
+            self.indexrel.available_disk_bytes(),
+            "index's tablespace",
+            written_bytes,
+        )
     }
 
     fn check_available(&self, available_bytes: Option<u64>, location: &str) -> Result<()> {
+        self.check_required(available_bytes, location, 0)
+    }
+
+    fn check_required(
+        &self,
+        available_bytes: Option<u64>,
+        location: &str,
+        written_bytes: u64,
+    ) -> Result<()> {
         let Some(segment_bytes) = self.segment_bytes else {
             // no sample yet: we can't estimate segment size until one has been written
             return Ok(());
@@ -179,7 +201,9 @@ impl DiskSpaceGuard {
 
         // Leave headroom for the output currently being written.
         let projected_segments = (self.remaining_segments as u64).saturating_add(1);
-        let required = segment_bytes.saturating_mul(projected_segments);
+        let required = segment_bytes
+            .saturating_mul(projected_segments)
+            .saturating_sub(written_bytes);
 
         let Some(available_bytes) = available_bytes else {
             return Ok(());
@@ -238,6 +262,58 @@ struct BuildSegments {
     index: Index,
     disk_guard: Option<DiskSpaceGuard>,
     sampled_docs: Option<u32>,
+    /// Bytes streamed into the index relation for the documents of the sampled staged segment.
+    sampled_streamed_bytes: u64,
+    /// Set while the partition being written streams its vector rows.
+    streamed: Option<StreamedPartition>,
+}
+
+/// A partition whose full-precision vector rows go straight into its final segment: the staged
+/// segments hold every other field, and the partition's merge finishes the segment the rows
+/// opened.
+struct StreamedPartition {
+    field: Field,
+    /// The partition's final segment and its rows, created at the first document.
+    target: Option<(Segment, VectorRowsWriter)>,
+    /// The next document's id in the final segment: documents are numbered as they are inserted.
+    next_doc: DocId,
+}
+
+impl StreamedPartition {
+    /// Moves `document`'s vector into the final segment as the row of the next document, and
+    /// returns the document for the staged segment, without the vector.
+    fn take_row(&mut self, index: &Index, document: TantivyDocument) -> Result<TantivyDocument> {
+        let doc = self.next_doc;
+        self.next_doc += 1;
+        if self.target.is_none() {
+            let target = index.new_segment();
+            let rows = VectorRowsWriter::create(&target, self.field)?;
+            self.target = Some((target, rows));
+        }
+        // A value that is not bytes stays in the document, for the staged writer to refuse.
+        let Some(row) = document
+            .get_first(self.field)
+            .and_then(|value| value.as_bytes())
+        else {
+            return Ok(document);
+        };
+        let (_, rows) = self.target.as_mut().expect("the target was just created");
+        rows.push(doc, row)?;
+        let mut staged = TantivyDocument::new();
+        for (field, value) in document.field_values() {
+            if field != self.field {
+                staged.add_field_value(field, value);
+            }
+        }
+        Ok(staged)
+    }
+
+    /// Bytes streamed into the index relation so far.
+    fn bytes_written(&self) -> u64 {
+        self.target
+            .as_ref()
+            .map_or(0, |(_, rows)| rows.bytes_written())
+    }
 }
 
 impl SerialIndexWriter {
@@ -260,8 +336,39 @@ impl SerialIndexWriter {
             index,
             disk_guard: None,
             sampled_docs: None,
+            sampled_streamed_bytes: 0,
+            streamed: None,
         });
         Ok(writer)
+    }
+
+    /// Starts a partition of `ctids` rows on a build writer that drains partitions, before its
+    /// first document.
+    ///
+    /// The partition streams its vector rows when the index sorts by `ctid` ascending, so that
+    /// the staged segments stack in insertion order; has one vector field, f32 and quantized;
+    /// and the partition's rows reach the clustering threshold. Any other partition stages its
+    /// rows with the rest of each document.
+    pub fn begin_partition(&mut self, ctids: usize) {
+        assert!(
+            self.pending_segment.is_none(),
+            "a partition starts before its first document"
+        );
+        let settings = self.index.settings();
+        let ctid_ascending = IndexSortByField {
+            field: CTID_FIELD_NAME.to_string(),
+            order: Order::Asc,
+        };
+        let field = VectorRowsWriter::field_for(&self.index).filter(|_| {
+            settings.sort_by_field.as_ref() == Some(&ctid_ascending)
+                && ctids >= settings.vector_clustering_threshold()
+        });
+        let build = self.build.as_mut().expect("writer must be an index build");
+        build.streamed = field.map(|field| StreamedPartition {
+            field,
+            target: None,
+            next_doc: 0,
+        });
     }
 
     pub fn persist_build_segments(&mut self, metas: &[SegmentMeta]) -> Result<Option<SegmentMeta>> {
@@ -269,11 +376,41 @@ impl SerialIndexWriter {
             return Ok(None);
         }
         pgrx::check_for_interrupts();
+        let build = self.build.as_mut().expect("writer must be an index build");
+        let streamed = build.streamed.take();
         if let Some(disk_guard) = &self.disk_guard {
-            disk_guard.check()?;
+            // A streamed partition's rows are in the index relation already.
+            disk_guard.check_written(streamed.as_ref().map_or(0, |s| s.bytes_written()))?;
         }
-        let build = self.build.as_ref().expect("writer must be an index build");
-        let segment = if let [meta] = metas
+        let segment = if let Some(StreamedPartition {
+            target: Some((target, rows)),
+            next_doc,
+            ..
+        }) = streamed
+        {
+            // The rows are in the target in insertion order, one document id per insert: the
+            // staged segments must hold exactly those documents. The merge checks that they stack.
+            let staged_docs: u64 = metas.iter().map(|meta| u64::from(meta.max_doc())).sum();
+            anyhow::ensure!(
+                staged_docs == u64::from(next_doc),
+                "internal error: {staged_docs} staged documents for {next_doc} documents with \
+                 streamed vector rows"
+            );
+            let segments: Vec<_> = metas
+                .iter()
+                .map(|meta| build.index.segment(meta.clone()))
+                .collect();
+            let directory = self.index.directory().clone();
+            let merger = IndexMerger::open(
+                self.index.schema(),
+                self.index.settings().clone(),
+                &segments,
+                Box::new(move || directory.wants_cancel()),
+                true,
+            )?;
+            let num_docs = merger.write_with_vector_rows(&target, rows)?;
+            target.with_max_doc(num_docs)
+        } else if let [meta] = metas
             && (!self.schema.has_vector_field()
                 || (meta.num_docs() as usize) < self.index.settings().vector_clustering_threshold())
         {
@@ -348,12 +485,18 @@ impl SerialIndexWriter {
             build.directory.available_disk_bytes(),
             "temporary tablespace",
         )?;
-        let final_bytes = (bytes as u128 * docs_per_final_segment as u128)
+        // The final segment holds what the sampled documents staged and what they streamed.
+        let final_bytes = ((bytes as u128 + build.sampled_streamed_bytes as u128)
+            * docs_per_final_segment as u128)
             .div_ceil(docs as u128)
             .min(u64::MAX as u128) as u64;
+        let streamed_bytes = build
+            .streamed
+            .as_ref()
+            .map_or(0, StreamedPartition::bytes_written);
         if let Some(guard) = &mut self.disk_guard {
             guard.set_segment_bytes(final_bytes);
-            guard.check()?;
+            guard.check_written(streamed_bytes)?;
         }
         Ok(Some(final_bytes))
     }
@@ -496,6 +639,17 @@ impl SerialIndexWriter {
         ctid: u64,
         on_finalize: OnFinalize,
     ) -> Result<Option<SegmentMeta>> {
+        if let Some(build) = self.build.as_mut()
+            && let Some(streamed) = build.streamed.as_mut()
+        {
+            if streamed.target.is_none()
+                && let Some(disk_guard) = &self.disk_guard
+            {
+                // The rows start to fill the index relation here, ahead of the partition's merge.
+                disk_guard.check()?;
+            }
+            document = streamed.take_row(&self.index, document)?;
+        }
         document.add_u64(self.ctid_field, ctid);
 
         if self.pending_segment.is_none() {
@@ -611,6 +765,10 @@ impl SerialIndexWriter {
                         build.directory.segment_byte_size(finalized_segment.id()),
                     );
                     build.sampled_docs = Some(finalized_segment.meta().max_doc());
+                    build.sampled_streamed_bytes = build
+                        .streamed
+                        .as_ref()
+                        .map_or(0, StreamedPartition::bytes_written);
                 }
                 guard.check_available(
                     build.directory.available_disk_bytes(),
