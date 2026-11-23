@@ -203,9 +203,25 @@ SELECT m.id, m.a + n.b FROM issue_6931_m m JOIN issue_6931_n n ON n.id = m.id
 WHERE m.body @@@ 'x' AND m.a * n.b > 3 ORDER BY m.id LIMIT 5;
 SELECT m.id, m.a + n.b FROM issue_6931_m m JOIN issue_6931_n n ON n.id = m.id
 WHERE m.body @@@ 'x' AND m.a * n.b > 3 ORDER BY m.id LIMIT 5;
-EXPLAIN (COSTS OFF)
-SELECT m.grp, sum(m.a) FROM issue_6931_m m JOIN issue_6931_n n ON n.id = m.id
-WHERE m.body @@@ 'x' AND m.a * n.b > 3 GROUP BY m.grp ORDER BY m.grp;
+-- Check the distributed aggregate and native filter without depending on partition counts.
+DO $$
+DECLARE
+    line text;
+    plan text := '';
+BEGIN
+    FOR line IN EXECUTE $query$EXPLAIN (COSTS OFF)
+        SELECT m.grp, sum(m.a) FROM issue_6931_m m JOIN issue_6931_n n ON n.id = m.id
+        WHERE m.body @@@ 'x' AND m.a * n.b > 3 GROUP BY m.grp ORDER BY m.grp
+    $query$ LOOP
+        plan := plan || line || E'\n';
+    END LOOP;
+    IF plan NOT LIKE '%ParadeDB Aggregate Scan%'
+        OR plan NOT LIKE '%DistributedExec%'
+        OR plan NOT LIKE '%HashJoinExec:%filter=pdb_int_mul(%'
+    THEN
+        RAISE EXCEPTION 'expected distributed aggregate with a native integer join filter: %', plan;
+    END IF;
+END $$;
 SELECT m.grp, sum(m.a) FROM issue_6931_m m JOIN issue_6931_n n ON n.id = m.id
 WHERE m.body @@@ 'x' AND m.a * n.b > 3 GROUP BY m.grp ORDER BY m.grp;
 

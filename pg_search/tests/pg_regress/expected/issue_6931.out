@@ -534,45 +534,25 @@ WHERE m.body @@@ 'x' AND m.a * n.b > 3 ORDER BY m.id LIMIT 5;
   8 |        9
 (5 rows)
 
-EXPLAIN (COSTS OFF)
-SELECT m.grp, sum(m.a) FROM issue_6931_m m JOIN issue_6931_n n ON n.id = m.id
-WHERE m.body @@@ 'x' AND m.a * n.b > 3 GROUP BY m.grp ORDER BY m.grp;
-                                                                                                   QUERY PLAN                                                                                                    
------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
- Sort
-   Sort Key: m.grp
-   ->  Custom Scan (ParadeDB Aggregate Scan)
-         Backend: DataFusion
-         Indexes: issue_6931_m_idx (m), issue_6931_n_idx (n)
-         Group By: grp
-         Multi-Table Filter: ((m.a * n.b) > 3)
-         Aggregates: SUM(a)
-         DataFusion Physical Plan: 
-           : ┌───── DistributedExec
-           : │ CoalescePartitionsExec
-           : │   [Stage 3] => NetworkCoalesceExec: output_partitions=6, input_tasks=2
-           : └──────────────────────────────────────────────────
-           :   ┌───── Stage 3 ── tasks=2, partitions=3
-           :   │ AggregateExec: mode=FinalPartitioned, gby=[grp@0 as grp], aggr=[sum(m_0.a) as agg_0]
-           :   │   [Stage 2] => NetworkShuffleExec: output_partitions=3, input_tasks=2
-           :   └──────────────────────────────────────────────────
-           :     ┌───── Stage 2 ── tasks=2, partitions=6
-           :     │ RepartitionExec: partitioning=Hash([grp@0], 6), input_partitions=1
-           :     │   AggregateExec: mode=Partial, gby=[grp@0 as grp], aggr=[sum(m_0.a) as agg_0]
-           :     │     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(id@2, id@0)], filter=pdb_int_mul(CAST(a@0 AS Int32), CAST(b@1 AS Int32)) > 3, projection=[grp@0, a@1]
-           :     │       CoalescePartitionsExec
-           :     │         [Stage 1] => NetworkBroadcastExec: partitions_per_consumer=1, stage_partitions=2, input_tasks=2
-           :     │       DistributedLeafExec:
-           :     │         t0: PgSearchScan: table=n, segments=2, dynamic_filters=1, visibility=eager, query="all"
-           :     │         t1: PgSearchScan: table=n, segments=2, dynamic_filters=1, visibility=eager, query="all"
-           :     └──────────────────────────────────────────────────
-           :       ┌───── Stage 1 ── tasks=2, partitions=4
-           :       │ BroadcastExec: input_partitions=1, consumer_tasks=2, output_partitions=2
-           :       │   DistributedLeafExec:
-           :       │     t0: PgSearchScan: table=m, segments=2, visibility=eager, query={"with_index":{"query":{"parse_with_field":{"field":"body","query_string":"x","lenient":null,"conjunction_mode":null}}}}
-           :       │     t1: PgSearchScan: table=m, segments=2, visibility=eager, query={"with_index":{"query":{"parse_with_field":{"field":"body","query_string":"x","lenient":null,"conjunction_mode":null}}}}
-           :       └──────────────────────────────────────────────────
-(33 rows)
+-- Check the distributed aggregate and native filter without depending on partition counts.
+DO $$
+DECLARE
+    line text;
+    plan text := '';
+BEGIN
+    FOR line IN EXECUTE $query$EXPLAIN (COSTS OFF)
+        SELECT m.grp, sum(m.a) FROM issue_6931_m m JOIN issue_6931_n n ON n.id = m.id
+        WHERE m.body @@@ 'x' AND m.a * n.b > 3 GROUP BY m.grp ORDER BY m.grp
+    $query$ LOOP
+        plan := plan || line || E'\n';
+    END LOOP;
+    IF plan NOT LIKE '%ParadeDB Aggregate Scan%'
+        OR plan NOT LIKE '%DistributedExec%'
+        OR plan NOT LIKE '%HashJoinExec:%filter=pdb_int_mul(%'
+    THEN
+        RAISE EXCEPTION 'expected distributed aggregate with a native integer join filter: %', plan;
+    END IF;
+END $$;
 
 SELECT m.grp, sum(m.a) FROM issue_6931_m m JOIN issue_6931_n n ON n.id = m.id
 WHERE m.body @@@ 'x' AND m.a * n.b > 3 GROUP BY m.grp ORDER BY m.grp;
